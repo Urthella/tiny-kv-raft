@@ -147,9 +147,19 @@ async fn nemesis(
                 }
                 "cut replies to the leader"
             }
-            _ => {
+            3 => {
                 cluster.router.set_loss_percent(rng.u32(5..30));
                 "lose messages"
+            }
+            _ => {
+                // Half the time the leader, since that's the crash that forces a failover.
+                let leader = cluster.believed_leaders().last().copied();
+                let victim = match leader {
+                    Some(id) if rng.bool() => id,
+                    _ => ids[rng.usize(0..ids.len())],
+                };
+                cluster.crash(victim).await;
+                "crash a node"
             }
         };
         *faults.entry(fault).or_insert(0) += 1;
@@ -158,8 +168,9 @@ async fn nemesis(
         tokio::time::sleep(Duration::from_millis(rng.u64(700..1500))).await;
         cluster.router.heal();
         cluster.router.set_loss_percent(0);
+        cluster.restart_all().await;
         tokio::time::sleep(Duration::from_millis(rng.u64(200..500))).await;
-        kind = rng.u8(0..4);
+        kind = rng.u8(0..5);
     }
     cluster.router.heal();
     cluster.router.set_loss_percent(0);
@@ -189,7 +200,7 @@ async fn wait_for_convergence(cluster: &Cluster) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    for n in &cluster.nodes {
+    for n in cluster.nodes() {
         let m = n.raft.metrics().borrow().clone();
         eprintln!(
             "node {}: {:?}, term {}, leader {:?}, last log {:?}, applied {:?}, snapshot {:?}, purged {:?}, {} keys",
