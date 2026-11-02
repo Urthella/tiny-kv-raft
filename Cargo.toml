@@ -1,0 +1,17 @@
+[package]
+name = "tiny-kv-raft"
+version = "0.1.0"
+edition = "2021"
+description = "A replicated key-value store on openraft, tested under partitions with a linearizability checker"
+license = "MIT"
+repository = "https://github.com/Urthella/tiny-kv-raft"
+
+[dependencies]
+fastrand = "2"
+openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints.clippy]
+result_large_err = "allow"
