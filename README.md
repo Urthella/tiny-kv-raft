@@ -39,7 +39,7 @@ old one and get the value from before its own write.
 | Read mode | Before answering | Result over 20 runs |
 | --- | --- | --- |
 | Default | Confirms with a quorum that this node still leads, using `ensure_linearizable` | 0 violations |
-| `--trust-local-leader` | Nothing | 20 runs with a violation |
+| `--trust-local-leader` | Nothing | 19 runs with a violation |
 
 An earlier batch caught it in 9 of 12 runs, so a single random run can miss it. The test
 `reading_from_a_partitioned_old_leader_is_caught` sets up the same bug step by step, so it fails every
@@ -51,11 +51,11 @@ Measured on one machine, with 5 nodes and 6 clients for 12 seconds per run:
 
 | Read mode | Runs | Writes acknowledged | Writes with no reply | Reads | Leader changes | Linearizable | Same data at the end |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Default | 40 | 40,600 | 2,222 | 40,396 | 159 | 40 | 40 |
-| `--trust-local-leader` | 20 | 26,002 | 1,151 | 27,130 | 87 | 0 | 20 |
+| Default | 20 | 24,584 | 1,058 | 24,494 | 99 | 20 | 20 |
+| `--trust-local-leader` | 20 | 28,772 | 1,072 | 29,921 | 93 | 1 | 20 |
 
 Passing runs are evidence, not proof. They cover the faults below for a short time, on a store that
-has no disk.
+has no real disk.
 
 ## What the nemesis does
 
@@ -66,6 +66,7 @@ isolating the leader. The others are picked at random:
 - split a minority from a majority
 - cut the replies to the leader, in one direction only
 - lose 5 to 30% of messages
+- crash a node, half the time the leader, and restart it when the fault ends
 
 Replies can also get lost after the work is done, which is the case a client can't tell apart from the
 work never having happened. A seed fixes the sequence of faults, but timing still varies, so a seed
@@ -85,7 +86,8 @@ for each operation, between its start and its return, at which every read sees t
 
 ## Limits
 
-- **No disk and no crashes here.** Nodes keep running through every fault, so this doesn't test recovery.
+- **Crashes are simulated.** A restarted node keeps its log, vote and snapshot as if they were on disk,
+  and loses the rest. Nothing is written to a real disk, so torn writes and lost fsyncs aren't tested.
 - **One process.** Delays are small and scheduling is shared, so real networks will behave differently.
 - **Registers only.** It has get and set, with no transactions or scans.
 - **Testing openraft, mostly.** A clean result is about this store and openraft together, and it's far
@@ -98,10 +100,20 @@ nix develop
 cargo test
 ```
 
-Planted bugs that the tests caught when this was built: a state machine that loses writes, safe reads
-that skip the quorum check, a snapshot that installs without its data, and a checker that ignores order or
-accepts any read. One wasn't caught: a `truncate` that does nothing. The leftover entries only matter
-when a node restarts and reads its log again, and nothing here restarts.
+To check that the tests can fail, 8 bugs were planted one at a time, and all 8 got caught:
+
+- a state machine that loses writes
+- safe reads that skip the quorum check
+- a `truncate` that does nothing
+- a snapshot that installs without its data
+- votes forgotten on restart
+- a restart that comes back with an empty state machine
+- a checker that ignores the order of operations
+- a checker that accepts any read
+
+Getting there took stronger tests. At first the `truncate` and vote bugs got through, and the snapshot bug
+was only caught some of the time, because those tests looked at what a running node believed and not at
+what it had stored. The tests that catch them now check the stored state directly.
 
 Claude, Anthropic's AI model, wrote this with Halil Utku Demirtaş directing the work.
 

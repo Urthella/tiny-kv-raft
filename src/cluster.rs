@@ -1,7 +1,7 @@
 //! A cluster of nodes in this process, and the read and write paths clients use.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use openraft::{Config, ServerState, SnapshotPolicy};
@@ -20,14 +20,29 @@ pub enum ReadMode {
     TrustLocalLeader,
 }
 
+impl Node {
+    pub async fn last_stored_index(&self) -> Option<u64> {
+        self.log.last_stored_index().await
+    }
+
+    pub async fn stored_term(&self) -> u64 {
+        self.log.stored_term().await
+    }
+}
+
+#[derive(Clone)]
 pub struct Node {
     pub id: NodeId,
     pub raft: Raft,
     pub state_machine: Arc<StateMachine>,
+    /// Stands in for the disk: it survives a crash, along with the vote and the snapshot.
+    log: LogStore,
+    up: bool,
 }
 
 pub struct Cluster {
-    pub nodes: Vec<Node>,
+    nodes: RwLock<Vec<Node>>,
+    config: Arc<Config>,
     pub router: Arc<Router>,
 }
 
@@ -55,11 +70,12 @@ impl Cluster {
                 router: router.clone(),
                 from: id,
             };
+            let log = LogStore::default();
             let raft = Raft::new(
                 id,
                 config.clone(),
                 network,
-                LogStore::default(),
+                log.clone(),
                 state_machine.clone(),
             )
             .await
@@ -69,6 +85,8 @@ impl Cluster {
                 id,
                 raft,
                 state_machine,
+                log,
+                up: true,
             });
         }
         let members: BTreeSet<NodeId> = (1..=size).collect();
@@ -77,22 +95,80 @@ impl Cluster {
             .initialize(members)
             .await
             .expect("the cluster initializes");
-        Cluster { nodes, router }
+        Cluster {
+            nodes: RwLock::new(nodes),
+            config,
+            router,
+        }
+    }
+
+    pub fn nodes(&self) -> Vec<Node> {
+        self.nodes.read().unwrap().clone()
     }
 
     pub fn ids(&self) -> Vec<NodeId> {
-        self.nodes.iter().map(|n| n.id).collect()
+        self.nodes().iter().map(|n| n.id).collect()
     }
 
-    pub fn node(&self, id: NodeId) -> &Node {
-        self.nodes.iter().find(|n| n.id == id).expect("known node")
+    pub fn node(&self, id: NodeId) -> Node {
+        self.nodes()
+            .into_iter()
+            .find(|n| n.id == id)
+            .expect("known node")
+    }
+
+    /// Stops a node as a crash would. What's in memory goes, and what's on "disk" stays.
+    pub async fn crash(&self, id: NodeId) {
+        self.router.remove(id);
+        let node = self.node(id);
+        let _ = node.raft.shutdown().await;
+        let mut nodes = self.nodes.write().unwrap();
+        nodes
+            .iter_mut()
+            .find(|n| n.id == id)
+            .expect("known node")
+            .up = false;
+    }
+
+    /// Starts a crashed node again from what it has on "disk". Does nothing to a node that's up.
+    pub async fn restart(&self, id: NodeId) {
+        let node = self.node(id);
+        if node.up {
+            return;
+        }
+        let state_machine = Arc::new(node.state_machine.recover().await);
+        let network = Network {
+            router: self.router.clone(),
+            from: id,
+        };
+        let raft = Raft::new(
+            id,
+            self.config.clone(),
+            network,
+            node.log.clone(),
+            state_machine.clone(),
+        )
+        .await
+        .expect("the node restarts");
+        self.router.add(id, raft.clone());
+        let mut nodes = self.nodes.write().unwrap();
+        let slot = nodes.iter_mut().find(|n| n.id == id).expect("known node");
+        slot.raft = raft;
+        slot.state_machine = state_machine;
+        slot.up = true;
+    }
+
+    pub async fn restart_all(&self) {
+        for id in self.ids() {
+            self.restart(id).await;
+        }
     }
 
     /// Nodes that believe they're the leader. During a partition there can be more than one.
     pub fn believed_leaders(&self) -> Vec<NodeId> {
-        self.nodes
+        self.nodes()
             .iter()
-            .filter(|n| n.raft.metrics().borrow().state == ServerState::Leader)
+            .filter(|n| n.up && n.raft.metrics().borrow().state == ServerState::Leader)
             .map(|n| n.id)
             .collect()
     }
@@ -147,15 +223,17 @@ impl Cluster {
 
     /// Stops the nodes, which also stops their background tasks.
     pub async fn shutdown(&self) {
-        for n in &self.nodes {
-            let _ = n.raft.shutdown().await;
+        for n in self.nodes() {
+            if n.up {
+                let _ = n.raft.shutdown().await;
+            }
         }
     }
 
     /// Every node's copy of the data, by node.
     pub async fn copies(&self) -> BTreeMap<NodeId, BTreeMap<String, String>> {
         let mut out = BTreeMap::new();
-        for n in &self.nodes {
+        for n in self.nodes() {
             out.insert(n.id, n.state_machine.values().await);
         }
         out

@@ -29,6 +29,18 @@ struct LogInner {
 #[derive(Clone, Default)]
 pub struct LogStore(Arc<Mutex<LogInner>>);
 
+impl LogStore {
+    /// The last entry actually stored, which is what a restart will believe.
+    pub async fn last_stored_index(&self) -> Option<u64> {
+        self.0.lock().await.entries.keys().next_back().copied()
+    }
+
+    /// The term of the stored vote, which is what a restart will believe.
+    pub async fn stored_term(&self) -> u64 {
+        self.0.lock().await.vote.map_or(0, |v| v.leader_id.term)
+    }
+}
+
 impl RaftLogReader<TypeConfig> for LogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
@@ -126,6 +138,28 @@ pub struct StateMachine {
 }
 
 impl StateMachine {
+    /// What a restarted node has: the last snapshot, as if read from disk, and nothing else. The log
+    /// replays the rest.
+    pub async fn recover(&self) -> Self {
+        let snapshot = self.snapshot.read().await;
+        let data = match snapshot.as_ref() {
+            Some(s) => SmData {
+                applied: s.meta.last_log_id,
+                membership: s.meta.last_membership.clone(),
+                values: serde_json::from_slice(&s.data).expect("we wrote this snapshot"),
+            },
+            None => SmData::default(),
+        };
+        StateMachine {
+            data: RwLock::new(data),
+            snapshot: RwLock::new(snapshot.as_ref().map(|s| StoredSnapshot {
+                meta: s.meta.clone(),
+                data: s.data.clone(),
+            })),
+            next_snapshot: AtomicU64::new(self.next_snapshot.load(Ordering::Relaxed)),
+        }
+    }
+
     /// Reads this node's copy. On its own this says nothing about what the cluster has committed.
     pub async fn get(&self, key: &str) -> Option<String> {
         self.data.read().await.values.get(key).cloned()

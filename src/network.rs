@@ -33,6 +33,10 @@ impl Router {
         self.nodes.write().unwrap().insert(id, raft);
     }
 
+    pub fn remove(&self, id: NodeId) {
+        self.nodes.write().unwrap().remove(&id);
+    }
+
     /// Cuts every link between the two groups, in both directions.
     pub fn partition(&self, a: &[NodeId], b: &[NodeId]) {
         let mut cuts = self.cuts.lock().unwrap();
